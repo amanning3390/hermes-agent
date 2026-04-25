@@ -109,7 +109,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
-  { path: "/kanban", label: "Kanban", icon: Columns3 },
+  { path: "/kanban", labelKey: "kanban", label: "Kanban", icon: Columns3 },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },

@@ -363,6 +363,16 @@ class TestFTS5Search:
         snippets = [r.get("snippet", "") for r in results]
         assert any("docker" in s.lower() or "Docker" in s for s in snippets)
 
+    def test_search_falls_back_when_fts5_unavailable(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Fallback search still works")
+        db._fts5_available = False
+
+        results = db.search_messages("Fallback search")
+
+        assert len(results) == 1
+        assert results[0]["session_id"] == "s1"
+
     def test_search_empty_query(self, db):
         assert db.search_messages("") == []
         assert db.search_messages("   ") == []
@@ -1911,4 +1921,3 @@ class TestAutoMaintenance:
         assert marker is not None
         # Should parse as a float timestamp close to now.
         assert abs(float(marker) - time.time()) < 60
-

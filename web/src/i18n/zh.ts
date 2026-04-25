@@ -71,6 +71,7 @@ export const zh: Translations = {
       config: "配置",
       cron: "定时任务",
       documentation: "文档",
+      kanban: "看板",
       keys: "密钥",
       logs: "日志",
       sessions: "会话",

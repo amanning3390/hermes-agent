@@ -26,6 +26,7 @@ from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
+_FTS5_WARNING_EMITTED = False
 
 T = TypeVar("T")
 
@@ -148,6 +149,7 @@ class SessionDB:
 
         self._lock = threading.Lock()
         self._write_count = 0
+        self._fts5_available = False
         self._conn = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
@@ -367,11 +369,28 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass  # Index already exists
 
-        # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
+        # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in
+        # executescript with IF NOT EXISTS reliably). FTS5 is an optional
+        # SQLite extension, so installations without it must still be able to
+        # open the state database and use non-search dashboard features.
         try:
             cursor.execute("SELECT * FROM messages_fts LIMIT 0")
-        except sqlite3.OperationalError:
-            cursor.executescript(FTS_SQL)
+            self._fts5_available = True
+        except sqlite3.OperationalError as exc:
+            try:
+                cursor.executescript(FTS_SQL)
+                self._fts5_available = True
+            except sqlite3.OperationalError as create_exc:
+                if "no such module: fts5" not in str(create_exc).lower():
+                    raise
+                self._fts5_available = False
+                global _FTS5_WARNING_EMITTED
+                if not _FTS5_WARNING_EMITTED:
+                    logger.warning(
+                        "SQLite FTS5 extension is unavailable; session search "
+                        "will use a slower LIKE fallback."
+                    )
+                    _FTS5_WARNING_EMITTED = True
 
         self._conn.commit()
 
@@ -1226,6 +1245,59 @@ class SessionDB:
                 return True
         return False
 
+    @staticmethod
+    def _like_query_from_search_query(query: str) -> str:
+        """Convert sanitized FTS-style input into a substring query."""
+        query = query.replace('"', " ").replace("*", " ")
+        query = re.sub(r"(?i)\b(AND|OR|NOT)\b", " ", query)
+        return re.sub(r"\s+", " ", query).strip()
+
+    def _search_messages_like(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Fallback message search for SQLite builds without FTS5."""
+        raw_query = self._like_query_from_search_query(query)
+        if not raw_query:
+            return []
+
+        like_where = ["m.content LIKE ?"]
+        like_params: list = [f"%{raw_query}%"]
+        if source_filter is not None:
+            like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+            like_params.extend(source_filter)
+        if exclude_sources is not None:
+            like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+            like_params.extend(exclude_sources)
+        if role_filter:
+            like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+            like_params.extend(role_filter)
+
+        like_sql = f"""
+            SELECT m.id, m.session_id, m.role,
+                   substr(m.content,
+                          max(1, instr(m.content, ?) - 40),
+                          120) AS snippet,
+                   m.content, m.timestamp, m.tool_name,
+                   s.source, s.model, s.started_at AS session_started
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {' AND '.join(like_where)}
+            ORDER BY m.timestamp DESC
+            LIMIT ? OFFSET ?
+        """
+        like_params.extend([limit, offset])
+        # instr() parameter goes first in the bound list.
+        like_params = [raw_query] + like_params
+        with self._lock:
+            like_cursor = self._conn.execute(like_sql, like_params)
+            return [dict(row) for row in like_cursor.fetchall()]
+
     def search_messages(
         self,
         query: str,
@@ -1254,94 +1326,87 @@ class SessionDB:
         if not query:
             return []
 
-        # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
-        params: list = [query]
+        if not self._fts5_available:
+            matches = self._search_messages_like(
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+            )
+        else:
+            matches = None
 
-        if source_filter is not None:
-            source_placeholders = ",".join("?" for _ in source_filter)
-            where_clauses.append(f"s.source IN ({source_placeholders})")
-            params.extend(source_filter)
+        if matches is None:
+            # Build WHERE clauses dynamically
+            where_clauses = ["messages_fts MATCH ?"]
+            params: list = [query]
 
-        if exclude_sources is not None:
-            exclude_placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
-            params.extend(exclude_sources)
-
-        if role_filter:
-            role_placeholders = ",".join("?" for _ in role_filter)
-            where_clauses.append(f"m.role IN ({role_placeholders})")
-            params.extend(role_filter)
-
-        where_sql = " AND ".join(where_clauses)
-        params.extend([limit, offset])
-
-        sql = f"""
-            SELECT
-                m.id,
-                m.session_id,
-                m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
-                m.timestamp,
-                m.tool_name,
-                s.source,
-                s.model,
-                s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            ORDER BY rank
-            LIMIT ? OFFSET ?
-        """
-
-        with self._lock:
-            try:
-                cursor = self._conn.execute(sql, params)
-            except sqlite3.OperationalError:
-                # FTS5 query syntax error despite sanitization — return empty
-                # unless query contains CJK (fall back to LIKE below)
-                if not self._contains_cjk(query):
-                    return []
-                matches = []
-            else:
-                matches = [dict(row) for row in cursor.fetchall()]
-
-        # LIKE fallback for CJK queries: FTS5 default tokenizer splits CJK
-        # characters individually, causing multi-character queries to fail.
-        if not matches and self._contains_cjk(query):
-            raw_query = query.strip('"').strip()
-            like_where = ["m.content LIKE ?"]
-            like_params: list = [f"%{raw_query}%"]
             if source_filter is not None:
-                like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
-                like_params.extend(source_filter)
+                source_placeholders = ",".join("?" for _ in source_filter)
+                where_clauses.append(f"s.source IN ({source_placeholders})")
+                params.extend(source_filter)
+
             if exclude_sources is not None:
-                like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
-                like_params.extend(exclude_sources)
+                exclude_placeholders = ",".join("?" for _ in exclude_sources)
+                where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
+                params.extend(exclude_sources)
+
             if role_filter:
-                like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
-                like_params.extend(role_filter)
-            like_sql = f"""
-                SELECT m.id, m.session_id, m.role,
-                       substr(m.content,
-                              max(1, instr(m.content, ?) - 40),
-                              120) AS snippet,
-                       m.content, m.timestamp, m.tool_name,
-                       s.source, s.model, s.started_at AS session_started
-                FROM messages m
+                role_placeholders = ",".join("?" for _ in role_filter)
+                where_clauses.append(f"m.role IN ({role_placeholders})")
+                params.extend(role_filter)
+
+            where_sql = " AND ".join(where_clauses)
+            params.extend([limit, offset])
+
+            sql = f"""
+                SELECT
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
+                    m.content,
+                    m.timestamp,
+                    m.tool_name,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started
+                FROM messages_fts
+                JOIN messages m ON m.id = messages_fts.rowid
                 JOIN sessions s ON s.id = m.session_id
-                WHERE {' AND '.join(like_where)}
-                ORDER BY m.timestamp DESC
+                WHERE {where_sql}
+                ORDER BY rank
                 LIMIT ? OFFSET ?
             """
-            like_params.extend([limit, offset])
-            # instr() parameter goes first in the bound list
-            like_params = [raw_query] + like_params
+
             with self._lock:
-                like_cursor = self._conn.execute(like_sql, like_params)
-                matches = [dict(row) for row in like_cursor.fetchall()]
+                try:
+                    cursor = self._conn.execute(sql, params)
+                except sqlite3.OperationalError as exc:
+                    if "no such module: fts5" in str(exc).lower():
+                        self._fts5_available = False
+                    # FTS5 query syntax error despite sanitization — return empty
+                    # unless query contains CJK or FTS5 is unavailable.
+                    if self._fts5_available and not self._contains_cjk(query):
+                        return []
+                    matches = []
+                else:
+                    matches = [dict(row) for row in cursor.fetchall()]
+
+        # LIKE fallback for CJK queries: FTS5 default tokenizer splits CJK
+        # characters individually, causing multi-character queries to fail. The
+        # same fallback handles SQLite builds where FTS5 is absent entirely.
+        if not matches and (self._contains_cjk(query) or not self._fts5_available):
+            matches = self._search_messages_like(
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+            )
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.
@@ -1653,4 +1718,3 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
-

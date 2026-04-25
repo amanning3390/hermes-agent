@@ -72,6 +72,7 @@ export interface Translations {
       config: string;
       cron: string;
       documentation: string;
+      kanban: string;
       keys: string;
       logs: string;
       sessions: string;
